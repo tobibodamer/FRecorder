@@ -63,15 +63,15 @@ public class Recorder : ObservableObject, IDisposable
     private set => SetProperty(ref _isRecording, value);
   }
 
-  public long CurrentPlaybackBufferSize => IsRecording && OutputDevice != null
+  public long CurrentPlaybackBufferSize => _soundBufferedWaveProvider != null
     ? (long)ByteSize.FromBytes(_soundBufferedWaveProvider.BufferedBytes).KiloBytes : 0;
-  public long CurrentMicBufferSize => IsRecording && InputDevice != null
+  public long CurrentMicBufferSize => _microphoneBufferedWaveProvider != null
     ? (long)ByteSize.FromBytes(_microphoneBufferedWaveProvider.BufferedBytes).KiloBytes : 0;
 
-  public long PlaybackBufferLength => IsRecording && OutputDevice != null
+  public long PlaybackBufferLength => _soundBufferedWaveProvider != null
     ? (long)ByteSize.FromBytes(_soundBufferedWaveProvider.BufferLength).KiloBytes : 0;
 
-  public long MicrophoneBufferLength => IsRecording && InputDevice != null
+  public long MicrophoneBufferLength => _microphoneBufferedWaveProvider != null
     ? (long)ByteSize.FromBytes(_microphoneBufferedWaveProvider.BufferLength).KiloBytes : 0;
 
 

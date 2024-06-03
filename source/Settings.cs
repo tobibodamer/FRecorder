@@ -11,8 +11,8 @@ public class Settings
     public string? SelectedInputDeviceId { get; set; }
     public string? SelectedOutputDeviceId { get; set; }
 
-    public bool AlwaysUseDefaultInputDevice { get; set; } = true;
-    public bool AlwaysUseDefaultOutputDevice { get; set; } = true;
+    public bool UseDefaultInputDevice { get; set; } = true;
+    public bool UseDefaultOutputDevice { get; set; } = true;
 
     public bool AutoStartRecording { get; set; } = true;
 

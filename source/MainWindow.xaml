@@ -8,7 +8,7 @@
         mc:Ignorable="d"
         Title="FRecorder 2.0.0" Height="450" Width="800">
     <Window.InputBindings>
-        <KeyBinding Gesture="Shift+F9" Command="{Binding SaveCommand}"
+        <KeyBinding Gesture="Shift+F9" Command="{Binding SaveRecordingCommand}"
                     HotkeyManager.RegisterGlobalHotkey="True"/>
     </Window.InputBindings>
     <Window.Resources>
@@ -143,7 +143,7 @@
         <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="10">
             <Button Margin="5" Width="80" Content="Start" Command="{Binding StartRecordingCommand}"/>
             <Button Margin="5" Width="80" Content="Stop" Command="{Binding StopRecordingCommand}"/>
-            <Button Margin="5" Width="80" Content="Save" Command="{Binding SaveCommand}"/>
+            <Button Margin="5" Width="80" Content="Save" Command="{Binding SaveRecordingCommand}"/>
         </StackPanel>
     </Grid>
 </Window>

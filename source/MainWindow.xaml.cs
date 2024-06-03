@@ -36,6 +36,7 @@ namespace FRecorder2
         .MinimumLevel.Debug()
         .WriteTo.RichTextBox(LogTraceTextBox, 
           outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}, {ThreadId}] {Message:lj}{NewLine}{Exception}", theme: RichTextBoxTheme.None)
+        .WriteTo.File(App.LogFileName)
         .Enrich.WithThreadId()
         .CreateLogger();
 
@@ -45,8 +46,8 @@ namespace FRecorder2
 
       DataContext = mainViewModel;
 
-      mainViewModel.LoadDevices();
-      mainViewModel.LoadFromSettings();
+      _ = mainViewModel.InitializeDevices();
+      mainViewModel.RestoreSettings();
     }
 
     protected override void OnClosing(CancelEventArgs e)

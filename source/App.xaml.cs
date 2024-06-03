@@ -24,6 +24,10 @@ namespace FRecorder2
       Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
       "FRecorder", "settings.json");
 
+    public static readonly string LogFileName = Path.Combine(
+      Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+      "FRecorder", "log.txt");
+
     public static Settings Settings { get; private set; } = new();
 
     public App()
@@ -52,6 +56,4 @@ namespace FRecorder2
       base.OnStartup(e);
     }
   }
-
-  
 }

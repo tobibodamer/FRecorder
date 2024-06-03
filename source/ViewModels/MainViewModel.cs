@@ -1,31 +1,49 @@
 ﻿using ByteSizeLib;
+
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
+
 using Serilog;
+
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Data;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
 using System.Media;
 using System.Printing;
+using System.Reactive.Disposables;
+using System.Reactive.Linq;
+using System.Reactive.Subjects;
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Threading;
 
 namespace FRecorder2
 {
   internal partial class MainViewModel : ObservableObject, IDisposable
   {
-    #region Devices
+    private readonly Recorder _recorder = new();
+    private readonly AudioDeviceManager _audioDeviceManager;
 
-    private readonly MMDeviceEnumerator _deviceEnumerator = new();
-    private readonly AsyncMMNotificationClient _mmNotificationClient;
-    private TaskCompletionSource<DataFlow> _defaultDeviceChangedTcs = new();
+
+    private MMDevice? _actualInputDevice = null;
+    private MMDevice? _actualOutputDevice = null;
+
+    private CancellationTokenSource _cts = new();
+    private readonly CompositeDisposable _disposables = [];
+
+
+    #region Devices
 
     [ObservableProperty]
     private ObservableCollection<DeviceViewModel> _inputDevices = [];
@@ -67,7 +85,7 @@ namespace FRecorder2
 
 
     [ObservableProperty]
-    [NotifyCanExecuteChangedFor(nameof(StopRecordingCommand), nameof(StartRecordingCommand), nameof(SaveCommand))]
+    [NotifyCanExecuteChangedFor(nameof(StopRecordingCommand), nameof(StartRecordingCommand), nameof(SaveRecordingCommand))]
     private bool _isRecording;
 
 
@@ -105,8 +123,6 @@ namespace FRecorder2
     [NotifyCanExecuteChangedFor(nameof(StartRecordingCommand), nameof(StopRecordingCommand))]
     private bool _isRunning;
 
-
-
     private TaskNotifier? _waitForDevice;
 
     /// <summary>
@@ -118,59 +134,30 @@ namespace FRecorder2
       set => SetPropertyAndNotifyOnCompletion(ref _waitForDevice, value);
     }
 
-    private TaskNotifier? _waitForDefaultDevice;
 
-    /// <summary>
-    /// The task that waits for the default device to change.
-    /// </summary>
-    public Task? WaitForDefaultDeviceTask
-    {
-      get => _waitForDefaultDevice;
-      set => SetPropertyAndNotifyOnCompletion(ref _waitForDefaultDevice, value);
-    }
-
-
-    private readonly Recorder _recorder = new();
-
-    public IAsyncRelayCommand SaveCommand { get; }
+    public IAsyncRelayCommand SaveRecordingCommand { get; }
 
     public IRelayCommand StartRecordingCommand { get; }
     public IRelayCommand StopRecordingCommand { get; }
 
+
     public MainViewModel()
     {
-      SaveCommand = new AsyncRelayCommand(Save, () => IsRecording);
+      SaveRecordingCommand = new AsyncRelayCommand(SaveRecording, () => IsRecording);
       StartRecordingCommand = new RelayCommand(Start, () => CanStartRecording() && !IsRunning);
       StopRecordingCommand = new AsyncRelayCommand(Stop, () => IsRunning);
-
-      _mmNotificationClient = new AsyncMMNotificationClient();
-      _deviceEnumerator.RegisterEndpointNotificationCallback(_mmNotificationClient);
-
-      _mmNotificationClient.DeviceStateChanged += OnDeviceStateChanged;
-      _mmNotificationClient.DefaultDeviceChanged += OnDefaultDeviceChanged;
-      _mmNotificationClient.DeviceAdded += OnDeviceAdded;
-      _mmNotificationClient.DeviceRemoved += OnDeviceRemoved;
 
       _recorder.RecordingStarted += Recorder_RecordingStarted;
       _recorder.RecordingStopped += Recorder_RecordingStopped;
       _recorder.NewData += Recorder_NewData;
+
+      _audioDeviceManager = new();
+
+      SetupAudioDeviceManagerSubscriptions();
     }
 
-    private void Recorder_NewData()
-    {
-      OnPropertyChanged(nameof(CurrentMicBufferLength));
-      OnPropertyChanged(nameof(CurrentPlaybackBufferLength));
-    }
 
-    private void Recorder_RecordingStarted()
-    {
-      IsRecording = true;
-    }
-
-    private void Recorder_RecordingStopped()
-    {
-      IsRecording = false;
-    }
+    #region UI Property changes
 
     partial void OnMicVolumeChanged(float value)
     {
@@ -190,22 +177,12 @@ namespace FRecorder2
 
     partial void OnSelectedInputDeviceChanged(DeviceViewModel? value)
     {
-      if (value == null && _recorder.InputDevice == null)
-      {
-        return;
-      }
-
-      RestartRecording(false);
+      _audioDeviceManager.ChangeInputDevice(value?.IsDefault == true ? AudioDeviceManager.DefaultDeviceId : value?.DeviceId);
     }
 
     partial void OnSelectedOutputDeviceChanged(DeviceViewModel? value)
     {
-      if (value == null && _recorder.OutputDevice == null)
-      {
-        return;
-      }
-
-      RestartRecording(false);
+      _audioDeviceManager.ChangeOutputDevice(value?.IsDefault == true ? AudioDeviceManager.DefaultDeviceId : value?.DeviceId);
     }
 
     partial void OnDurationInSChanged(uint value)
@@ -233,6 +210,27 @@ namespace FRecorder2
       RestartRecording(false);
     }
 
+    #endregion
+
+
+    #region Recording
+
+    private void Recorder_NewData()
+    {
+      OnPropertyChanged(nameof(CurrentMicBufferLength));
+      OnPropertyChanged(nameof(CurrentPlaybackBufferLength));
+    }
+
+    private void Recorder_RecordingStarted()
+    {
+      IsRecording = true;
+    }
+
+    private void Recorder_RecordingStopped()
+    {
+      IsRecording = false;
+    }
+
     private bool CanStartRecording()
     {
       if (_recorder.IsRecording)
@@ -241,19 +239,17 @@ namespace FRecorder2
       }
 
       // At least one (enabled) device must be available
-      return (MicRecordEnabled && SelectedInputDevice?.Device != null) ||
-        (SoundRecordEnabled && SelectedOutputDevice?.Device != null);
+      return (MicRecordEnabled && _actualInputDevice != null) ||
+        (SoundRecordEnabled && _actualOutputDevice != null);
     }
 
     private void Start()
     {
       _cts = new();
 
-      _defaultDeviceChangedTcs = new();
-
       _recorder.StartRecording(
-        MicRecordEnabled ? SelectedInputDevice?.Device : null,
-        SoundRecordEnabled ? SelectedOutputDevice?.Device : null,
+        MicRecordEnabled ? _actualInputDevice : null,
+        SoundRecordEnabled ? _actualOutputDevice : null,
         SamplingRate,
         SelectedInputDevice?.NumChannels ?? -1,
         SelectedOutputDevice?.NumChannels ?? -1);
@@ -267,15 +263,11 @@ namespace FRecorder2
 
       _cts.Cancel();
 
+      // Await tasks to ensure they are finished
+
       if (WaitForDeviceTask != null)
       {
         await WaitForDeviceTask;
-      }
-
-      if (WaitForDefaultDeviceTask != null)
-      {
-        _defaultDeviceChangedTcs?.TrySetCanceled();
-        await WaitForDefaultDeviceTask;
       }
 
       if (_recorder.IsRecording)
@@ -291,6 +283,13 @@ namespace FRecorder2
     {
       if (!IsRecording && !startIfNotStarted)
       {
+        // recording is not started, dont start
+        return;
+      }
+
+      if (WaitForDeviceTask != null && !WaitForDeviceTask.IsCompleted)
+      {
+        // Already in wait loop
         return;
       }
 
@@ -303,61 +302,13 @@ namespace FRecorder2
 
       if (!CanStartRecording() && !IsRecording)
       {
+        // Seems like no device is available, so wait
         Log.Information("Cannot start recording: no device available. Waiting for device...");
 
-        WaitForDeviceTask = Task.Run(() =>
+        if (WaitForDeviceTask != null && !WaitForDeviceTask.IsCompleted)
         {
-          while (!_cts.IsCancellationRequested)
-          {
-            Log.Verbose("Retrying again...");
-
-            if (CanStartRecording())
-            {
-              Log.Verbose("CanStartRecording is true, terminating loop.");
-              return;
-            }
-          }
-        }, _cts.Token).ContinueWith(t =>
-        {
-          if (t.IsCanceled)
-          {
-            Log.Debug("Canceled waiting for device.");
-          }
-          else if (t.IsFaulted)
-          {
-            Log.Debug(t.Exception?.InnerException, "Error waiting for device");
-          }
-          else if (CanStartRecording() && !_cts.IsCancellationRequested)
-          {
-            Log.Information("Device available, trying to start...");
-            Start();
-          }
-        }, _cts.Token, TaskContinuationOptions.None, TaskScheduler.FromCurrentSynchronizationContext());
-
-        //_waitForDeviceAvailableTcs = new();
-
-        //// Wait for MMNotification thread to receive available device. Then
-        //// continue trying again (on the current synchronization context
-        //// to prevent COM errors).
-        //WaitForDeviceTask = _waitForDeviceAvailableTcs.Task.ContinueWith(t =>
-        //{
-        //  if (t.IsCanceled)
-        //  {
-        //    Log.Debug("Canceled waiting for device.");
-        //  }
-        //  else if (t.IsFaulted)
-        //  {
-        //    Log.Debug(t.Exception?.InnerException, "Error waiting for device");
-        //    t.Exception?.Handle(_ => true);
-        //  }
-        //  else
-        //  {
-        //    Log.Debug("Received device available signal, trying again...");
-
-        //    // Try again
-        //    Start();
-        //  }
-        //}, _cts.Token, TaskContinuationOptions.None, TaskScheduler.FromCurrentSynchronizationContext());
+          WaitForDeviceTask ??= Task.Run(() => WaitUntilCanStartRecording(_cts.Token));
+        }
 
         return;
       }
@@ -365,176 +316,260 @@ namespace FRecorder2
       Start();
     }
 
+    private async Task WaitUntilCanStartRecording(CancellationToken cancellationToken)
+    {
+      try
+      {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+          Log.Verbose("Retrying again...");
+
+          if (CanStartRecording())
+          {
+            Log.Verbose("CanStartRecording is true, terminating loop.");
+            break;
+          }
+
+          await Task.Delay(2, cancellationToken);
+        }
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+          Log.Debug("Canceled waiting for device.");
+          return;
+        }
+
+        if (CanStartRecording())
+        {
+          Log.Information("Device available, trying to start...");
+          await Application.Current.Dispatcher.InvokeAsync(Start);
+          return;
+        }
+
+        Log.Information("Device unavailable, waiting more...");
+        await WaitUntilCanStartRecording(cancellationToken);
+      }
+      catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+      {
+        Log.Debug("Canceled waiting for device.");
+      }
+      catch (Exception ex)
+      {
+        Log.Debug(ex, "Error waiting for device");
+      }
+    }
+
+    public async Task SaveRecording()
+    {
+      string timestamp = DateTime.Now.ToString("yy_MM_dd_HH_mm_ss");
+      string fileName = FileNameTemplate.Replace("{Timestamp}", timestamp, StringComparison.CurrentCultureIgnoreCase) + ".wav";
+      string fullFileName = Path.Combine(RecordingFolder, fileName);
+
+      var savedDuration = await _recorder.Save(fullFileName);
+      if (savedDuration == null)
+      {
+        Log.Warning("Could not save recording.");
+        return;
+      }
+
+      LastSavedFile = new(new(fullFileName))
+      {
+        Duration = (int)savedDuration.Value.TotalSeconds
+      };
+
+      SystemSounds.Exclamation.Play();
+    }
+
+    #endregion
+
 
     #region Device handling
 
-    private CancellationTokenSource _cts = new();
-
-    private IEnumerable<ICollection<DeviceViewModel>> GetDeviceCollectionsFromFlow(DataFlow flow)
+    private void SetupAudioDeviceManagerSubscriptions()
     {
-      if (flow is DataFlow.Capture or DataFlow.All)
-      {
-        yield return InputDevices;
-      }
+      // Default devices
+      _audioDeviceManager.DefaultInputDeviceIdO
+        .Subscribe(id => Log.Debug("Default input device changed '{id}'", id))
+        .DisposeWith(_disposables);
 
-      if (flow is DataFlow.Render or DataFlow.All)
-      {
-        yield return OutputDevices;
-      }
-    }
-    private string GetDeviceTypeFromCol(ICollection<DeviceViewModel> col)
-    {
-      if (col == InputDevices)
-      {
-        return "input";
-      }
-      else
-      {
-        return "output";
-      }
-    }
+      _audioDeviceManager.DefaultOutputDeviceIdO
+        .Subscribe(id => Log.Debug("Default output device changed '{id}'", id))
+        .DisposeWith(_disposables);
 
-    private bool RemoveDevice(string deviceId)
-    {
-      bool removed = false;
-      bool selectedDeviceRemoved = false;
+      _audioDeviceManager.DefaultInputDeviceO?
+       .Subscribe(OnDefaultInputDeviceChanged)
+       .DisposeWith(_disposables);
 
-      // Find specific device to remove (not the default device since it should never be removed)
-      var inputDeviceToRemove = InputDevices.FirstOrDefault(d => d.DeviceId == deviceId && !d.IsDefault);
-      if (inputDeviceToRemove != null)
+      _audioDeviceManager.DefaultOutputDeviceO
+        .Subscribe(OnDefaultOutputDeviceChanged)
+        .DisposeWith(_disposables);
+
+
+      // Add / Remove
+
+      _audioDeviceManager.DeviceRemovedO
+        .Select((x) => OnDeviceRemoved(x.deviceType, x.deviceId, x.wasDefault))
+        .Subscribe()
+        .DisposeWith(_disposables);
+
+      _audioDeviceManager.DeviceAddedO
+        .Select((x) => OnDeviceAdded(x.deviceType, x.device))
+        .Subscribe()
+        .DisposeWith(_disposables);
+
+
+      // Selected Devices
+
+      _audioDeviceManager.ActualSelectedInputDeviceO
+        .Subscribe(OnActualSelectedInputDeviceChanged)
+        .DisposeWith(_disposables);
+
+      _audioDeviceManager.ActualSelectedOutputDeviceO
+        .Subscribe(OnActualSelectedOutputDeviceChanged)
+        .DisposeWith(_disposables);
+
+      _audioDeviceManager.SelectedInputDeviceIdO.Subscribe((selectedDeviceId) =>
       {
-        selectedDeviceRemoved |= SelectedInputDevice == inputDeviceToRemove;
-        InputDevices.Remove(inputDeviceToRemove);
-        Log.Information("Input device removed: {deviceName}", inputDeviceToRemove.DisplayName);
-        removed = true;
-      }
+        Log.Debug("User selected input device '{selectedDeviceId}'", selectedDeviceId);
 
-      var outputDeviceToRemove = OutputDevices.FirstOrDefault(d => d.DeviceId == deviceId && !d.IsDefault);
-      if (outputDeviceToRemove != null)
-      {
-        selectedDeviceRemoved |= SelectedOutputDevice == outputDeviceToRemove;
-        OutputDevices.Remove(outputDeviceToRemove);
-        Log.Information("Output device removed: {deviceName}", outputDeviceToRemove.DisplayName);
-        removed = true;
-      }
-
-      if (!selectedDeviceRemoved)
-      {
-        // Nothing to worry about, since it was not a selected device
-        return removed;
-      }
-
-      bool restartRecording = false;
-
-      if (IsRecording)
-      {
-        Log.Information("Removed device was in use, stopping recording");
-        _recorder.StopRecording();
-        restartRecording = true;
-      }
-
-      if (IsDefaultDeviceSelected(DataFlow.All))
-      {
-        Log.Verbose("Removed device was default, waiting for new default device before restarting recording...");
-
-        WaitForDefaultDeviceTask = WaitForDefaultDeviceAsync(restartRecording: true, _cts.Token);
-      }
-      else
-      {
-        Log.Debug("Switching to another device...");
-        EnsureDevicesSelected();
-
-        bool restartRecordingAutomaticallyForNonDefault = true;
-        if (restartRecording && restartRecordingAutomaticallyForNonDefault)
+        // Sync change back by selecting correct viewmodel
+        if (selectedDeviceId == AudioDeviceManager.DefaultDeviceId)
         {
-          // Restart recording, if still stopped
-          Start();
+          SelectDefaultInputDevice();
         }
         else
         {
-          // Stop everything
-          Task.Factory.StartNew(Stop, _cts.Token, TaskCreationOptions.None, TaskScheduler.FromCurrentSynchronizationContext());
+          SelectedInputDevice = InputDevices.FirstOrDefault(vm => vm.DeviceId == selectedDeviceId);
         }
-      }
+      });
 
-      // not found
-      return removed;
-    }
-
-    private Task WaitForDefaultDeviceAsync(bool restartRecording, CancellationToken cancellationToken = default)
-    {
-      return Task.Factory.StartNew(async () =>
+      _audioDeviceManager.SelectedOutputDeviceIdO.Subscribe((selectedDeviceId) =>
       {
-        // wait for default device change
-        if (await Task.WhenAny(Task.Delay(1000, cancellationToken), _defaultDeviceChangedTcs.Task) == _defaultDeviceChangedTcs.Task)
+        Log.Debug("User selected output device '{selectedDeviceId}'", selectedDeviceId);
+
+        // Sync change back by selecting correct viewmodel
+        if (selectedDeviceId == AudioDeviceManager.DefaultDeviceId)
         {
-          Log.Debug("New default {dataFlow} device received, switching.", _defaultDeviceChangedTcs.Task.Result);
-          _defaultDeviceChangedTcs = new();
+          SelectDefaultInputDevice();
         }
         else
         {
-          Log.Warning("Timed out while waiting for default device to change, trying anyways.");
+          SelectedOutputDevice = OutputDevices.FirstOrDefault(vm => vm.DeviceId == selectedDeviceId);
         }
-
-        EnsureDevicesSelected();
-
-        if (restartRecording)
-        {
-          // Restart recording, if still stopped
-          Start();
-        }
-
-      }, cancellationToken, TaskCreationOptions.None, TaskScheduler.FromCurrentSynchronizationContext());
+      });
     }
 
-    private void AddDeviceIfNotPresent(MMDevice newDevice)
+    private void OnActualSelectedInputDeviceChanged(MMDevice? newInputDevice)
     {
-      bool deviceAdded = false;
+      Log.Debug("Actual selected input device '{deviceName}'", newInputDevice?.FriendlyName);
 
-      foreach (var col in GetDeviceCollectionsFromFlow(newDevice.DataFlow))
+      _actualInputDevice = newInputDevice;
+
+      if (newInputDevice == null && _recorder.InputDevice == null)
       {
-        if (col.Any(d => d.DeviceId == newDevice.ID))
+        return;
+      }
+
+      RestartRecording(false);
+    }
+
+    private void OnActualSelectedOutputDeviceChanged(MMDevice? newOutputDevice)
+    {
+      Log.Debug("Actual selected input device '{deviceName}'", newOutputDevice?.FriendlyName);
+
+      _actualOutputDevice = newOutputDevice;
+
+      if (newOutputDevice == null && _recorder.OutputDevice == null)
+      {
+        return;
+      }
+
+      RestartRecording(false);
+    }
+
+    private void OnDefaultInputDeviceChanged(MMDevice? newDefaultDevice)
+    {
+      try
+      {
+        Log.Information("Default input device changed to '{name}'.", newDefaultDevice?.FriendlyName);
+        DefaultInputDevice.Device = newDefaultDevice;
+      }
+      catch (Exception ex)
+      {
+        Log.Error(ex, "Error while updating default device for '{deviceId}'", newDefaultDevice?.ID);
+      }
+    }
+
+    private void OnDefaultOutputDeviceChanged(MMDevice? newDefaultDevice)
+    {
+      Log.Information("Default output device changed to '{name}'.", newDefaultDevice?.FriendlyName);
+
+      try
+      {
+        DefaultOutputDevice.Device = newDefaultDevice;
+      }
+      catch (Exception ex)
+      {
+        Log.Error(ex, "Error while updating default device for '{deviceId}'", newDefaultDevice?.ID);
+      }
+    }
+
+    private (bool removed, bool wasSelected) OnDeviceRemoved(
+      AudioDeviceManager.MMDeviceType deviceType, string deviceId, bool wasDefault)
+    {
+      Log.Information("Device removed ({deviceType}): '{deviceId}' ({wasDefault}).",
+        deviceType, deviceId, wasDefault);
+
+      if (deviceType is AudioDeviceManager.MMDeviceType.Input)
+      {
+        var inputDeviceToRemove = InputDevices.FirstOrDefault(d => d.DeviceId == deviceId && !d.IsDefault);
+        if (inputDeviceToRemove != null)
         {
-          // Device already there
-          continue;
+          bool isSelected = SelectedInputDevice?.DeviceId == deviceId;
+
+          if (wasDefault)
+          {
+            DefaultInputDevice.Device = null;
+          }
+
+          Log.Information("Input device removed: {deviceName}", inputDeviceToRemove.DisplayName);
+          return (removed: InputDevices.Remove(inputDeviceToRemove), wasSelected: isSelected);
         }
-
-        try
+      }
+      else
+      {
+        var outputDeviceToRemove = OutputDevices.FirstOrDefault(d => d.DeviceId == deviceId && !d.IsDefault);
+        if (outputDeviceToRemove != null)
         {
-          Log.Information("Adding {deviceType} device '{deviceName}'",
-            GetDeviceTypeFromCol(col), newDevice.FriendlyName);
+          bool isSelected = SelectedOutputDevice?.DeviceId == deviceId;
 
-          col.Add(new DeviceViewModel(newDevice, false));
-
-          deviceAdded = true;
-        }
-        catch (Exception ex)
-        {
-          Log.Error(ex, "Error while adding device '{deviceId}'.", newDevice.ID);
+          Log.Information("Output device removed: {deviceName}", outputDeviceToRemove.DisplayName);
+          return (removed: OutputDevices.Remove(outputDeviceToRemove), wasSelected: isSelected);
         }
       }
 
-      //if (deviceAdded && _waitForDeviceAvailableTcs != null)
-      //{
-      //  Log.Debug("Waiting for new default device before signaling restart...");
+      return (removed: false, wasSelected: false);
+    }
 
-      //  WaitForDefaultDeviceTask = WaitForDefaultDeviceAsync(restartRecording: false, _cts.Token)
-      //    .ContinueWith(t =>
-      //    {
-      //      if (t.IsCanceled)
-      //      {
-      //        _waitForDeviceAvailableTcs?.TrySetCanceled();
-      //      }
-      //      else if (t.IsFaulted)
-      //      {
-      //        _waitForDeviceAvailableTcs?.TrySetException(t.Exception?.InnerExceptions ?? Enumerable.Empty<Exception>());
-      //      }
-      //      else
-      //      {
-      //        _waitForDeviceAvailableTcs?.TrySetResult();
-      //      }
-      //    });
-      //}
+    private bool OnDeviceAdded(AudioDeviceManager.MMDeviceType deviceType, MMDevice newDevice)
+    {
+      Log.Information("Device added: {deviceName}", newDevice.FriendlyName);
+
+      if (deviceType is AudioDeviceManager.MMDeviceType.Input &&
+          !InputDevices.Any(vm => vm.DeviceId == newDevice.ID && !vm.IsDefault))
+      {
+        InputDevices.Add(new DeviceViewModel(newDevice, false));
+
+        return true;
+      }
+      else if (!OutputDevices.Any(vm => vm.DeviceId == newDevice.ID && !vm.IsDefault))
+      {
+        OutputDevices.Add(new DeviceViewModel(newDevice, false));
+
+        return true;
+      }
+
+      return false;
     }
 
     /// <summary>
@@ -553,142 +588,6 @@ namespace FRecorder2
       }
     }
 
-    private bool IsDefaultDeviceSelected(DataFlow flow)
-    {
-      return flow switch
-      {
-        DataFlow.Render => IsDefaultSoundDeviceSelected,
-        DataFlow.Capture => IsDefaultInputDeviceSelected,
-        DataFlow.All => IsDefaultInputDeviceSelected || IsDefaultSoundDeviceSelected,
-        _ => false
-      };
-    }
-
-    private void OnDeviceRemoved(string deviceId)
-    {
-      try
-      {
-        RemoveDevice(deviceId);
-      }
-      catch (Exception ex)
-      {
-        Log.Error(ex, "Error while removing device '{deviceId}'.", deviceId);
-      }
-    }
-
-    private void OnDeviceAdded(string deviceId)
-    {
-      var newDevice = _deviceEnumerator.GetDevice(deviceId);
-
-      AddDeviceIfNotPresent(newDevice);
-    }
-
-    private void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId)
-    {
-      if (role is not Role.Console)
-      {
-        return;
-      }
-
-      Log.Verbose("Default device changed to '{defaultDeviceId}' for flow '{flow}'.",
-              defaultDeviceId, flow, role);
-
-      bool isDefaultDeviceSelected = IsDefaultDeviceSelected(flow);
-
-      try
-      {
-
-        foreach (var devices in GetDeviceCollectionsFromFlow(flow))
-        {
-          var newDefaultDevice = devices.FirstOrDefault(x => x.DeviceId == defaultDeviceId && !x.IsDefault);
-          if (devices == InputDevices)
-          {
-            DefaultInputDevice.Device = newDefaultDevice?.Device;
-
-            Log.Information("Default input device changed to '{deviceName}'", newDefaultDevice?.DisplayName);
-          }
-          else
-          {
-            DefaultOutputDevice.Device = newDefaultDevice?.Device;
-
-            Log.Information("Default output device changed to '{deviceName}'", newDefaultDevice?.DisplayName);
-          }
-        }
-
-        if (IsRecording && isDefaultDeviceSelected)
-        {
-          // Restart recording
-          RestartRecording();
-        }
-
-        // Notify waiting task
-        _defaultDeviceChangedTcs.TrySetResult(flow);
-      }
-      catch (Exception ex)
-      {
-        Log.Error(ex, "Error while updating default device for '{deviceId}'", defaultDeviceId);
-      }
-    }
-
-    private void OnDeviceStateChanged(string deviceId, DeviceState newState)
-    {
-      try
-      {
-        Log.Debug("Device state changed for '{deviceId}'. New state: {deviceState}",
-          deviceId, newState);
-
-        if (!newState.HasFlag(DeviceState.Active))
-        {
-          RemoveDevice(deviceId);
-        }
-        else
-        {
-          var device = _deviceEnumerator.GetDevice(deviceId);
-          AddDeviceIfNotPresent(device);
-        }
-      }
-      catch (Exception ex)
-      {
-        Log.Error(ex, "Error while handling device state change for device '{deviceId}'", deviceId);
-      }
-    }
-
-    private MMDevice? GetDefaultDevice(DataFlow flow, Role role = Role.Console)
-    {
-      if (_deviceEnumerator.HasDefaultAudioEndpoint(flow, role))
-      {
-        return _deviceEnumerator.GetDefaultAudioEndpoint(flow, role);
-      }
-      else
-      {
-        return null;
-      }
-    }
-
-    public void LoadDevices()
-    {
-      foreach (MMDevice device in _deviceEnumerator.EnumerateAudioEndPoints(DataFlow.Capture, DeviceState.Active))
-      {
-        InputDevices.Add(new DeviceViewModel(device, false));
-      }
-
-      foreach (MMDevice device in _deviceEnumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
-      {
-        OutputDevices.Add(new DeviceViewModel(device, false));
-      }
-
-      var defaultInputDevice = GetDefaultDevice(DataFlow.Capture);
-      var defaultOutputDevice = GetDefaultDevice(DataFlow.Render);
-
-      DefaultInputDevice.Device = defaultInputDevice;
-      DefaultOutputDevice.Device = defaultOutputDevice;
-
-      InputDevices.Insert(0, DefaultInputDevice);
-      OutputDevices.Insert(0, DefaultOutputDevice);
-
-      EnsureDevicesSelected();
-    }
-
     public void SelectDefaultInputDevice()
     {
       SelectedInputDevice = DefaultInputDevice;
@@ -699,26 +598,72 @@ namespace FRecorder2
       SelectedOutputDevice = DefaultOutputDevice;
     }
 
+    public async Task InitializeDevices()
+    {
+      try
+      {
+        Log.Debug("Initializing devices...");
+
+        InputDevices.Add(DefaultInputDevice);
+        OutputDevices.Add(DefaultOutputDevice);
+
+        var activeInputDevices = await _audioDeviceManager.ActiveInputDevicesO.FirstValueFromAsync();
+        foreach (var device in activeInputDevices)
+        {
+          InputDevices.Add(new DeviceViewModel(device, false));
+        }
+
+        var activeOutputDevices = await _audioDeviceManager.ActiveOutputDevicesO.FirstValueFromAsync();
+        foreach (var device in activeOutputDevices)
+        {
+          OutputDevices.Add(new DeviceViewModel(device, false));
+        }
+
+        EnsureDevicesSelected();
+
+        Log.Information("Devices initialized.");
+      }
+      catch (Exception ex)
+      {
+        Log.Error(ex, "Error while initializing devices");
+      }
+    }
+
     #endregion
 
+
     #region Settings
-    public void LoadFromSettings()
+    public void RestoreSettings()
     {
-      if (!App.Settings.AlwaysUseDefaultOutputDevice && App.Settings.SelectedOutputDeviceId != null)
+      Log.Debug("Restoring from settings...");
+
+      if (!App.Settings.UseDefaultOutputDevice && App.Settings.SelectedOutputDeviceId != null)
       {
+        Log.Debug("Restoring selected output device '{deviceId}'", App.Settings.SelectedOutputDeviceId);
+
         var outputDeviceToSelect = OutputDevices.FirstOrDefault(d => d.DeviceId == App.Settings.SelectedOutputDeviceId);
         if (outputDeviceToSelect != null)
         {
           SelectedOutputDevice = outputDeviceToSelect;
         }
+        else
+        {
+          Log.Debug("Could not restore saved output device: Not found");
+        }
       }
 
-      if (!App.Settings.AlwaysUseDefaultInputDevice && App.Settings.SelectedInputDeviceId != null)
+      if (!App.Settings.UseDefaultInputDevice && App.Settings.SelectedInputDeviceId != null)
       {
+        Log.Debug("Restoring selected input device '{deviceId}'", App.Settings.SelectedInputDeviceId);
+
         var outputInputToSelect = InputDevices.FirstOrDefault(d => d.DeviceId == App.Settings.SelectedInputDeviceId);
         if (outputInputToSelect != null)
         {
           SelectedInputDevice = outputInputToSelect;
+        }
+        else
+        {
+          Log.Debug("Could not restore saved input device: Not found");
         }
       }
 
@@ -753,8 +698,8 @@ namespace FRecorder2
         App.Settings.SelectedOutputDeviceId = SelectedOutputDevice.DeviceId;
       }
 
-      App.Settings.AlwaysUseDefaultInputDevice = IsDefaultInputDeviceSelected;
-      App.Settings.AlwaysUseDefaultOutputDevice = IsDefaultSoundDeviceSelected;
+      App.Settings.UseDefaultInputDevice = IsDefaultInputDeviceSelected;
+      App.Settings.UseDefaultOutputDevice = IsDefaultSoundDeviceSelected;
 
       App.Settings.RecordDurationInSeconds = DurationInS;
       App.Settings.RecordingFolder = RecordingFolder;
@@ -767,33 +712,10 @@ namespace FRecorder2
 
     #endregion
 
-    public async Task Save()
-    {
-      string timestamp = DateTime.Now.ToString("yy_MM_dd_HH_mm_ss");
-      string fileName = FileNameTemplate.Replace("{Timestamp}", timestamp, StringComparison.CurrentCultureIgnoreCase) + ".wav";
-      string fullFileName = Path.Combine(RecordingFolder, fileName);
-
-      var savedDuration = await _recorder.Save(fullFileName);
-      if (savedDuration == null)
-      {
-        Log.Warning("Could not save recording.");
-        return;
-      }
-
-      LastSavedFile = new(new(fullFileName))
-      {
-        Duration = (int)savedDuration.Value.TotalSeconds
-      };
-
-      SystemSounds.Exclamation.Play();
-    }
-
     public void Dispose()
     {
-      _deviceEnumerator.UnregisterEndpointNotificationCallback(_mmNotificationClient);
-      _deviceEnumerator.Dispose();
-
       _recorder.Dispose();
+      _audioDeviceManager.Dispose();
     }
   }
 }
